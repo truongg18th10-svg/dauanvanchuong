@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function myRole() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role : 'none';
+    }
+    function hasRole(list) { return signedIn() && myRole() in list; }
+    function isAdmin()      { return hasRole(['superadmin', 'admin']); }
+    function isStaff()      { return hasRole(['superadmin', 'admin', 'teacher', 'content_writer']); }
+    function canModerate()  { return hasRole(['superadmin', 'admin']); }
+
+    // Hồ sơ người dùng. Tự đăng ký chỉ được vai trò "member"; chỉ super admin đổi vai trò.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'member'
+        && request.resource.data.keys().hasOnly(['email', 'name', 'role', 'createdAt']);
+      allow update: if hasRole(['superadmin']) && request.auth.uid != uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role'])
+        && request.resource.data.role in ['admin', 'teacher', 'content_writer', 'member'];
+      allow delete: if false;
+    }
+
+    // Cảm nhận: ai cũng gửi được (chờ duyệt); chỉ bản đã duyệt mới đọc công khai.
+    match /reflections/{id} {
+      allow read: if resource.data.status == 'approved' || canModerate();
+      allow create: if request.resource.data.keys().hasOnly(['name', 'thought', 'status', 'createdAt'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 60
+        && request.resource.data.thought is string
+        && request.resource.data.thought.size() >= 5 && request.resource.data.thought.size() <= 1500
+        && request.resource.data.createdAt == request.time;
+      allow update: if canModerate()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status in ['approved', 'rejected'];
+      allow delete: if isAdmin();
+    }
+
+    // Nội dung bài học: admin đăng thẳng; giáo viên / người viết gửi "pending" chờ duyệt.
+    match /lessons/{id} {
+      function validLesson() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['grade', 'title', 'summary', 'part2', 'status', 'authorUid', 'authorName', 'updatedAt'])
+          && d.grade in ['6', '7', '8', '9']
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 150
+          && d.summary is string && d.summary.size() <= 20000
+          && d.part2 is string && d.part2.size() <= 20000
+          && d.status in ['pending', 'published'];
+      }
+      allow read: if resource.data.status == 'published' || isStaff();
+      allow create: if isStaff() && validLesson()
+        && request.resource.data.authorUid == request.auth.uid
+        && (request.resource.data.status == 'pending' || isAdmin());
+      allow update: if validLesson() && (isAdmin() ||
+        (isStaff() && resource.data.authorUid == request.auth.uid
+          && request.resource.data.authorUid == request.auth.uid
+          && request.resource.data.status == 'pending'));
+      allow delete: if isAdmin();
+    }
+  }
+}
